@@ -115,6 +115,7 @@ pub struct Author {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Content {
     content_type: String,
+    #[serde(default = "Default::default")]
     parts: Vec<String>,
 }
 
