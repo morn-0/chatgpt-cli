@@ -1,10 +1,12 @@
 #![recursion_limit = "256"]
 
 use anyhow::Result;
+use api::{COOKIE, TOKEN};
 use clap::{Parser, Subcommand};
-use std::env;
+use std::env::{set_var, var};
 
 mod api;
+mod util;
 
 #[derive(Subcommand)]
 enum Commands {
@@ -20,23 +22,22 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    env::set_var("CURL_IMPERSONATE", "ff91esr");
-
     let Cli { command } = Cli::parse();
 
-    let token = env::var("CHATGPT_TOKEN")?;
-    let cookie = env::var("CHATGPT_COOKIE")?;
+    COOKIE.get_or_init(|| var("CHATGPT_COOKIE").expect("The environment variable is not set."));
+    TOKEN.get_or_init(|| var("CHATGPT_TOKEN").expect("The environment variable is not set."));
+    set_var("CURL_IMPERSONATE", "ff91esr");
 
     match command {
         Commands::List => {
-            let conversations = api::conversations(&token, &cookie)?;
+            let conversations = api::conversations()?;
 
             for conversation in conversations.items {
                 println!("{} - {}", conversation.title, conversation.id);
             }
         }
         Commands::Ask { id, message } => {
-            api::conversation(&token, &cookie, &id, &message)?;
+            api::conversation(&id, &message)?;
         }
     }
 

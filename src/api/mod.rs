@@ -1,5 +1,6 @@
+use crate::util;
 use anyhow::Result;
-use curl::easy::{Easy, List};
+use curl::easy::{Easy, List, WriteError};
 use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,15 +11,8 @@ mod arkose;
 mod crypto;
 mod sse;
 
-fn http() -> &'static reqwest::blocking::Client {
-    static HTTP: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    HTTP.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .cookie_store(true)
-            .build()
-            .unwrap()
-    })
-}
+pub static COOKIE: OnceLock<String> = OnceLock::new();
+pub static TOKEN: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PublicKey {
@@ -53,35 +47,37 @@ pub struct Item {
     pub title: String,
 }
 
-pub fn conversations(token: &str, cookie: &str) -> Result<Conversations> {
+pub fn conversations() -> Result<Conversations> {
     const URL: &str = "https://chat.openai.com/backend-api/conversations";
 
     let url = format!("{URL}?offset={}&limit={}&order=updated", 0, 50);
+    request::<Conversations>(&url, None, None)
+}
 
-    let mut list = List::new();
-    list.append("Host: chat.openai.com")?;
-    list.append(&format!("Authorization: Bearer {}", token))?;
-    list.append("Connection: keep-alive")?;
-    list.append(&format!("Cookie: {}", cookie))?;
-    list.append("Referer: https://chat.openai.com/")?;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConversationInfo {
+    conversation_id: String,
+    title: String,
+    pub current_node: String,
+    mapping: HashMap<String, Node>,
+    moderation_results: Vec<String>,
+    create_time: f64,
+    update_time: f64,
+}
 
-    let buffer = RefCell::new(Vec::new());
-    let write = |buf: &[u8]| {
-        buffer.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    };
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Node {
+    id: String,
+    message: Option<Message>,
+    parent: Option<String>,
+    children: Option<Vec<String>>,
+}
 
-    let mut easy = Easy::new();
-    easy.url(&url)?;
-    easy.http_headers(list)?;
+pub fn conversation_info(conversation_id: &str) -> Result<ConversationInfo> {
+    const URL: &str = "https://chat.openai.com/backend-api/conversation";
 
-    let mut transfer = easy.transfer();
-    transfer.write_function(write)?;
-    transfer.perform()?;
-
-    let buffer = buffer.borrow();
-    let body = String::from_utf8_lossy(&buffer);
-    Ok(serde_json::from_str::<Conversations>(&body)?)
+    let url = format!("{URL}/{conversation_id}");
+    request::<ConversationInfo>(&url, None, None)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,8 +133,15 @@ pub struct FinishDetails {
     type_field: String,
 }
 
-pub fn conversation(token: &str, cookie: &str, conversation_id: &str, message: &str) -> Result<()> {
+pub fn conversation(conversation_id: &str, message: &str) -> Result<()> {
     const URL: &str = "https://chat.openai.com/backend-api/conversation";
+
+    let (cookie, token) = match (|| Some((COOKIE.get()?, TOKEN.get()?)))() {
+        Some(v) => v,
+        None => {
+            panic!("Either cookie or token is missing");
+        }
+    };
 
     let mut list = List::new();
     list.append("Host: chat.openai.com")?;
@@ -149,7 +152,7 @@ pub fn conversation(token: &str, cookie: &str, conversation_id: &str, message: &
     list.append("Origin: https://chat.openai.com")?;
     list.append("Content-Type: application/json")?;
 
-    let conversation_info = conversation_info(token, cookie, conversation_id)?;
+    let conversation_info = conversation_info(conversation_id)?;
 
     let json = json!({
         "action": "next",
@@ -174,11 +177,10 @@ pub fn conversation(token: &str, cookie: &str, conversation_id: &str, message: &
         "parent_message_id": conversation_info.current_node,
         "suggestions": [],
         "timezone_offset_min": -480
-    })
-    .to_string();
-    let json_buf = json.as_bytes();
+    });
+    let json_str = json.to_string();
 
-    let mut last = String::new();
+    let mut last_part = String::new();
     let buffer = RefCell::new(String::new());
 
     let write = move |buf: &[u8]| {
@@ -197,8 +199,10 @@ pub fn conversation(token: &str, cookie: &str, conversation_id: &str, message: &
 
                 if let Some(message) = value.message {
                     for part in message.content.parts {
-                        print!("{}", part.replace(&last, ""));
-                        last = part;
+                        print!("{}", part.replace(&last_part, ""));
+
+                        last_part.clear();
+                        last_part.push_str(&part);
                     }
                 }
             }
@@ -211,8 +215,10 @@ pub fn conversation(token: &str, cookie: &str, conversation_id: &str, message: &
     easy.post(true)?;
     easy.url(URL)?;
     easy.http_headers(list)?;
-    easy.post_field_size(json_buf.len() as u64)?;
-    easy.post_fields_copy(json_buf)?;
+
+    let buf = json_str.as_bytes();
+    easy.post_field_size(buf.len() as u64)?;
+    easy.post_fields_copy(buf)?;
 
     let mut transfer = easy.transfer();
     transfer.write_function(write)?;
@@ -221,32 +227,28 @@ pub fn conversation(token: &str, cookie: &str, conversation_id: &str, message: &
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConversationInfo {
-    conversation_id: String,
-    title: String,
-    pub current_node: String,
-    mapping: HashMap<String, Node>,
-    moderation_results: Vec<String>,
-    create_time: f64,
-    update_time: f64,
+fn http() -> &'static reqwest::blocking::Client {
+    static HTTP: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    HTTP.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .cookie_store(true)
+            .build()
+            .unwrap()
+    })
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Node {
-    id: String,
-    message: Option<Message>,
-    parent: Option<String>,
-    children: Option<Vec<String>>,
-}
+type Write<'data> = Box<dyn FnMut(&[u8]) -> Result<usize, WriteError> + 'data>;
 
-pub fn conversation_info(
-    token: &str,
-    cookie: &str,
-    conversation_id: &str,
-) -> Result<ConversationInfo> {
-    const URL: &str = "https://chat.openai.com/backend-api/conversation";
-    let url = format!("{URL}/{conversation_id}");
+fn request<T>(url: &str, body: Option<&str>, write: Option<Write>) -> Result<T>
+where
+    T: Serialize + for<'de> Deserialize<'de> + 'static,
+{
+    let (cookie, token) = match (|| Some((COOKIE.get()?, TOKEN.get()?)))() {
+        Some(v) => v,
+        None => {
+            panic!("Either cookie or token is missing");
+        }
+    };
 
     let mut list = List::new();
     list.append("Host: chat.openai.com")?;
@@ -256,21 +258,37 @@ pub fn conversation_info(
     list.append("Referer: https://chat.openai.com/")?;
     list.append("Origin: https://chat.openai.com")?;
 
+    if body.is_some() {
+        list.append("Content-Type: application/json")?;
+    }
+
     let buffer = RefCell::new(Vec::new());
-    let write = |buf: &[u8]| {
+    let write = write.unwrap_or(Box::new(|buf: &[u8]| {
         buffer.borrow_mut().extend_from_slice(buf);
         Ok(buf.len())
-    };
+    }));
 
     let mut easy = Easy::new();
-    easy.url(&url)?;
+    easy.url(url)?;
     easy.http_headers(list)?;
+
+    if let Some(body) = body {
+        easy.post(true)?;
+
+        let buf = body.as_bytes();
+        easy.post_fields_copy(buf)?;
+        easy.post_field_size(buf.len() as u64)?;
+    }
 
     let mut transfer = easy.transfer();
     transfer.write_function(write)?;
     transfer.perform()?;
 
-    let buffer = buffer.borrow();
-    let body = String::from_utf8_lossy(&buffer);
-    Ok(serde_json::from_str::<ConversationInfo>(&body)?)
+    if util::is_unit::<T>() {
+        Ok(serde_json::from_str::<T>("null")?)
+    } else {
+        let buffer = buffer.borrow();
+        let body = String::from_utf8_lossy(&buffer);
+        Ok(serde_json::from_str::<T>(&body)?)
+    }
 }
