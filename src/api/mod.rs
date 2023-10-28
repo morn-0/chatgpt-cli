@@ -3,7 +3,7 @@ use anyhow::Result;
 use curl::easy::{Easy, List, WriteError};
 use log::error;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 use uuid::Uuid;
 
@@ -239,7 +239,7 @@ fn http() -> &'static reqwest::blocking::Client {
 
 type Write<'data> = Box<dyn FnMut(&[u8]) -> Result<usize, WriteError> + 'data>;
 
-fn request<T>(url: &str, body: Option<&str>, write: Option<Write>) -> Result<T>
+fn request<T>(url: &str, body: Option<Value>, write: Option<Write>) -> Result<T>
 where
     T: Serialize + for<'de> Deserialize<'de> + 'static,
 {
@@ -273,11 +273,12 @@ where
     easy.http_headers(list)?;
 
     if let Some(body) = body {
-        easy.post(true)?;
+        let body_str = body.to_string();
+        let bytes = body_str.as_bytes();
 
-        let buf = body.as_bytes();
-        easy.post_fields_copy(buf)?;
-        easy.post_field_size(buf.len() as u64)?;
+        easy.post_fields_copy(bytes)?;
+        easy.post_field_size(bytes.len() as u64)?;
+        easy.post(true)?;
     }
 
     let mut transfer = easy.transfer();
