@@ -5,9 +5,8 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "std"] }
-curl = { git = "https://github.com/morn-0/curl-rust", branch = "curl-sys-0.4.63", features = [
+curl = { git = "https://github.com/alexcrichton/curl-rust", tag = "curl-sys-0.4.63", features = [
     "http2",
-    "impersonate-ff",
 ], default-features = false }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

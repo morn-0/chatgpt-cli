@@ -1,10 +1,10 @@
 use crate::util;
 use anyhow::Result;
-use curl::easy::{Easy, List, WriteError};
+use curl::easy::{Easy, List};
 use log::error;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
+use serde_json::json;
+use std::{cell::RefCell, collections::HashMap, iter, sync::OnceLock};
 use uuid::Uuid;
 
 mod arkose;
@@ -51,7 +51,7 @@ pub fn conversations() -> Result<Conversations> {
     const URL: &str = "https://chat.openai.com/backend-api/conversations";
 
     let url = format!("{URL}?offset={}&limit={}&order=updated", 0, 50);
-    request::<Conversations>(&url, None, None)
+    request::<iter::Empty<String>, String, Conversations>(false, &url, None, None)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,7 +77,7 @@ pub fn conversation_info(conversation_id: &str) -> Result<ConversationInfo> {
     const URL: &str = "https://chat.openai.com/backend-api/conversation";
 
     let url = format!("{URL}/{conversation_id}");
-    request::<ConversationInfo>(&url, None, None)
+    request::<iter::Empty<String>, String, ConversationInfo>(false, &url, None, None)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,10 +237,11 @@ fn http() -> &'static reqwest::blocking::Client {
     })
 }
 
-type Write<'data> = Box<dyn FnMut(&[u8]) -> Result<usize, WriteError> + 'data>;
-
-fn request<T>(url: &str, body: Option<Value>, write: Option<Write>) -> Result<T>
+fn request<H, B, T>(post: bool, url: &str, headers: Option<H>, body: Option<B>) -> Result<T>
 where
+    H: Iterator,
+    H::Item: AsRef<str>,
+    B: AsRef<[u8]>,
     T: Serialize + for<'de> Deserialize<'de> + 'static,
 {
     let (cookie, token) = match (|| Some((COOKIE.get()?, TOKEN.get()?)))() {
@@ -258,31 +259,31 @@ where
     list.append("Referer: https://chat.openai.com/")?;
     list.append("Origin: https://chat.openai.com")?;
 
-    if body.is_some() {
-        list.append("Content-Type: application/json")?;
+    if let Some(headers) = headers {
+        for header in headers {
+            list.append(header.as_ref())?;
+        }
     }
 
     let buffer = RefCell::new(Vec::new());
-    let write = write.unwrap_or(Box::new(|buf: &[u8]| {
-        buffer.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }));
 
     let mut easy = Easy::new();
+    easy.post(post)?;
     easy.url(url)?;
     easy.http_headers(list)?;
 
     if let Some(body) = body {
-        let body_str = body.to_string();
-        let bytes = body_str.as_bytes();
+        let bytes = body.as_ref();
 
         easy.post_fields_copy(bytes)?;
         easy.post_field_size(bytes.len() as u64)?;
-        easy.post(true)?;
     }
 
     let mut transfer = easy.transfer();
-    transfer.write_function(write)?;
+    transfer.write_function(|buf: &[u8]| {
+        buffer.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    })?;
     transfer.perform()?;
 
     if util::is_unit::<T>() {
